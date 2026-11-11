@@ -132,6 +132,9 @@ fn a_dial_parked_until_the_daemon_registers_20_s_later_connects_on_its_first_att
     // The connect log has every attempt's route line (each followed by its
     // phases line): this one alone.
     assert_eq!(route_lines(&world), [route.trim_end()], "the dial retried");
+    // Parked for 8 s, the dial looked at the machine (carrier/adopt.rs): an exec, which
+    // the stand-in refuses. It is no carrier request: the platform got the dial's one.
+    assert_eq!(world.keys.lock().unwrap().len(), 1, "the look counted as a carrier request");
 }
 
 /// The route lines of the dial's connect log, without its phases lines.
