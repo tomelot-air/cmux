@@ -131,7 +131,7 @@ struct FirstClickPolicyTests {
         window.orderFront(nil)
         facts.append("orderFront: visible=\(window.isVisible) number=\(window.windowNumber) "
             + "onScreen=\(window.occlusionState.contains(.visible))")
-        window.beginSheet(sheet)
+        window.beginSheet(sheet, completionHandler: nil)
         facts.append("beginSheet: attached=\(window.attachedSheet === sheet) sheets=\(window.sheets.count) "
             + "parent=\(sheet.sheetParent === window) sheetVisible=\(sheet.isVisible)")
         window.orderFrontRegardless()
@@ -145,7 +145,7 @@ struct FirstClickPolicyTests {
         let secondSheet = panel()
         defer { close(secondSheet, second) }
         second.orderFrontRegardless()
-        second.beginSheet(secondSheet)
+        second.beginSheet(secondSheet, completionHandler: nil)
         facts.append("orderFrontRegardless first: visible=\(second.isVisible) attached=\(second.attachedSheet === secondSheet) "
             + "sheets=\(second.sheets.count)")
         second.endSheet(secondSheet)
