@@ -127,18 +127,103 @@ fn a_reset_file_is_not_written_back() {
 }
 
 #[test]
-fn turning_the_setting_off_stops_counting_at_the_next_tick() {
+fn turning_the_setting_off_stops_counting_and_writes_what_was_counted() {
     let dir = scratch("toggle");
     let on = config(&dir, true);
     let recorder = Recorder::open(&dir.join("out"), "session-a", on.clone());
     recorder.count("command", "split");
-    // A different size so the stamp changes even within one mtime tick.
-    std::fs::write(&on, "{\"diagnostics\":{\"usagePatterns\":false}}  ").unwrap();
-    recorder.tick();
+    // The same size as the file that turned it on: the gate reads the file, it does not go by
+    // the file's size or time.
+    let off = "// a comment\n{ \"diagnostics\": { \"usagePatterns\": false} }\n";
+    assert_eq!(off.len() as u64, std::fs::metadata(&on).unwrap().len());
+    std::fs::write(&on, off).unwrap();
+    assert!(!recorder.settings_changed());
     assert!(!recorder.enabled());
     recorder.count("command", "split");
     assert_eq!(recorder.snapshot().counts["command"]["split"], 1);
     assert!(recorder.path().exists(), "turning off writes what was counted");
+}
+
+/// The flush thread has nothing to do until something is counted: it stays parked (no timer),
+/// writes the first count after a quiet time at once, and later counts at most every
+/// [`FLUSH_EVERY`].
+#[test]
+fn nothing_is_due_to_be_written_until_something_is_counted() {
+    let dir = scratch("due");
+    let recorder = Recorder::open(&dir.join("out"), "session-a", config(&dir, true));
+    assert_eq!(recorder.flush_wait(), None, "nothing counted: the flush thread stays parked");
+    recorder.peak("connections.open", 0);
+    assert_eq!(recorder.flush_wait(), None, "a peak that did not rise is nothing to write");
+    recorder.count("command", "split");
+    assert_eq!(recorder.flush_wait(), Some(Duration::ZERO), "the first count is written at once");
+    recorder.flush().unwrap();
+    assert_eq!(recorder.flush_wait(), None, "written: parked again");
+    recorder.count("command", "split");
+    let wait = recorder.flush_wait().expect("a count after a write is due");
+    assert!(
+        wait <= FLUSH_EVERY && wait > FLUSH_EVERY / 2,
+        "the next write waits for the rest of FLUSH_EVERY, not {wait:?}"
+    );
+
+    let off = Recorder::open(&dir.join("out-off"), "session-a", config(&dir, false));
+    off.count("command", "split");
+    assert_eq!(off.flush_wait(), None, "off: nothing is counted, so nothing is ever due");
+}
+
+/// While counting was never on, a settings hint starts no thread; the first hint that finds it on
+/// starts the flush thread once.
+#[test]
+fn the_flush_thread_starts_only_when_counting_is_on() {
+    let dir = scratch("lazy");
+    let recorder = Arc::new(Recorder::open(&dir.join("out"), "session-a", config(&dir, false)));
+    recorder.follow_setting();
+    recorder.follow_setting();
+    assert!(recorder.flusher.get().is_none(), "off: no flush thread");
+    config(&dir, true);
+    recorder.follow_setting();
+    let first = recorder.flusher.get().and_then(Option::as_ref).map(std::thread::Thread::id);
+    assert!(first.is_some(), "on: the flush thread runs");
+    config(&dir, false);
+    recorder.follow_setting();
+    config(&dir, true);
+    recorder.follow_setting();
+    let again = recorder.flusher.get().and_then(Option::as_ref).map(std::thread::Thread::id);
+    assert_eq!(first, again, "one flush thread for the recorder's life");
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let end = Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(Instant::now() < end, "timed out waiting for: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// End to end with the real watch: a change of the settings file turns counting on with no
+/// poll, the first count is written by the flush thread, and turning it off writes the rest.
+#[test]
+fn a_watched_recorder_follows_the_settings_file() {
+    let dir = scratch("watch");
+    let settings = config(&dir, false);
+    let out = dir.join("out");
+    let recorder = Arc::new(Recorder::open(&out, "session-a", settings.clone()));
+    let watch = recorder.watch().expect("the settings watch starts");
+    assert!(!recorder.enabled());
+
+    let splits =
+        || read_dir(&out).rollup.counts.get("command").and_then(|keys| keys.get("split")).copied();
+    config(&dir, true);
+    wait_for("the watch to turn counting on", || recorder.enabled());
+    recorder.count("command", "split");
+    wait_for("the flush thread to write the first count", || splits() == Some(1));
+
+    // Due only after the rest of FLUSH_EVERY, so the write below is the one that turning the
+    // setting off makes.
+    recorder.count("command", "split");
+    std::fs::write(&settings, "{\"diagnostics\":{\"usagePatterns\":false}}").unwrap();
+    wait_for("the watch to turn counting off", || !recorder.enabled());
+    wait_for("turning off to write what was counted", || splits() == Some(2));
+    drop(watch);
 }
 
 #[test]
