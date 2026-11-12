@@ -12,8 +12,10 @@ Owner of the change: RUST TIP REDS (a tip-red repair of #40554, which added the 
   - The gate follows the settings file by kernel file events (`cmux_config::watch::Watcher`, the
     same watch the daemon's settings owner uses: inotify on Linux, kqueue on macOS), not by a
     timer. The watch thread (`cmux-config-watch`) is blocked in the kernel. It wakes when an
-    entry of the settings folder changes (or a missing folder on the way to it appears), and it
-    rereads the setting only when that entry is the settings file.
+    entry of the settings folder changes, and it rereads the setting only when that entry is the
+    settings file. While the settings folder is missing, it wakes for an entry that is made,
+    removed or renamed in the nearest folder that exists, and rereads nothing until the settings
+    folder appears (the settings owner's watch does the same).
   - The flush thread `usage-patterns` starts the first time counting is on. It is parked while
     there is nothing to write. The first count after a write unparks it; it then writes at most
     every 30 s (`FLUSH_EVERY`). The first count after a quiet time is written at once.
@@ -31,9 +33,11 @@ Owner of the change: RUST TIP REDS (a tip-red repair of #40554, which added the 
   held within 30 s. Now there is no write pass while nothing is counted: the recorder drops what
   it held at the write that its next count starts, and that count (with any other made before
   that write) goes with it. The reset stays a reset: the old counts are never written back.
-- Not changed: what is counted, the file format, the setting, `_acpmux/stats`. A settings file
-  that becomes a symlink after the process started is not followed to its new target (the
-  settings owner has the same limit).
+- A second behavior that is different, on Linux only: a settings file that becomes a symlink
+  after the process started is not followed to its new target (the 5 s check read through the
+  link; the settings owner's watch has the same limit). On macOS a save of the target is seen
+  through the watch on the file itself.
+- Not changed: what is counted, the file format, the setting, `_acpmux/stats`.
 - Found by the review in the code as #40554 merged it, not changed here: `flush` holds the state
   lock across one `stat` and the serialization, so a count can wait behind them; `written` is set
   before a write that can fail, and the next flush then reads the missing file as a reset; the

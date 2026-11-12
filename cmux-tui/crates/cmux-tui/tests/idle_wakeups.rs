@@ -476,13 +476,10 @@ fn cmux_next_daemon_idle_has_no_periodic_wakeups() {
 fn cmux_next_daemon_follows_the_usage_patterns_setting_and_stays_idle() {
     let daemon = Daemon::start("usage");
     let files = daemon.dir.join("usage-patterns");
-    let commands = || {
-        cmux_usage_patterns::read_dir(&files)
-            .rollup
-            .counts
-            .get("command")
-            .map_or(0, |keys| keys.values().sum::<u64>())
-    };
+    // Any family: a request on a new connection is counted two times (`connection` at the
+    // accept, `command` after the parse), and the write that the first count starts can be
+    // made before the second count. That second count is written 30 s later.
+    let counted = || !cmux_usage_patterns::read_dir(&files).rollup.counts.is_empty();
     let ask = |id: u64| {
         request(&daemon.socket, serde_json::json!({"id": id, "cmd": "list-workspaces"}))
             .expect("list-workspaces");
@@ -495,11 +492,11 @@ fn cmux_next_daemon_follows_the_usage_patterns_setting_and_stays_idle() {
         "{ \"diagnostics\": { \"usagePatterns\": true } }\n",
     )
     .unwrap();
-    // The same daemon counts the commands that come after the save, and writes the first
+    // The same daemon counts the requests that come after the save, and writes the first
     // count at once.
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut id = 11;
-    while commands() == 0 {
+    while !counted() {
         assert!(
             Instant::now() < deadline,
             "the running daemon did not start to count after the setting was turned on"

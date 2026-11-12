@@ -20,7 +20,7 @@
 //! rollup keeps the newest [`KEEP_DAYS`] days, and the hour histogram has 24
 //! slots, so a file never grows past a fixed size.
 //!
-//! Nothing here runs on a timer. A kernel file watch on the settings file
+//! No periodic timer runs here. A kernel file watch on the settings file
 //! ([`Recorder::watch`]) tells the recorder when the setting may have changed;
 //! its thread is blocked in the kernel until an entry of the settings folder
 //! changes (as the settings owner's watch is). The flush thread starts the
