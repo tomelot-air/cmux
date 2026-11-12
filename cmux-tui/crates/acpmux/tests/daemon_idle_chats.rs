@@ -33,7 +33,7 @@ const IDLE_CHILD_SECS: &str = "3";
 const SETTLE: Duration = Duration::from_secs(15);
 /// Quiet window over which wakeups are counted, and how many (the median is judged).
 const WINDOW: Duration = Duration::from_secs(10);
-const WINDOWS: u32 = 3;
+const WINDOWS: u32 = 6;
 /// Context switches allowed per process in its median window: a 1 Hz wake gives 10.
 const MAX_SWITCHES_PER_WINDOW: u64 = 5;
 /// CPU allowed per process in its median window: 0.5 % of one core.
@@ -415,10 +415,13 @@ impl Drop for Daemon {
     }
 }
 
-fn start(scratch: &Path, home: &Path) -> (Daemon, PathBuf) {
+/// PROBE: the daemon's log lines, each with the time the test read it.
+type Log = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, String)>>>;
+
+fn start(scratch: &Path, home: &Path) -> (Daemon, PathBuf, Log) {
     let socket = scratch.join("s.sock");
     let mut child = daemon_env::command(scratch, daemon_env::Agents::StandIn, &[])
-        .args(["daemon", "run", "--ready-fd", "1", "--log", "warn"])
+        .args(["daemon", "run", "--ready-fd", "1", "--log", "trace"])
         .env("ACPMUX_HOME", home)
         .env("ACPMUX_SOCKET", &socket)
         .env("ACPMUX_IDLE_CHILD_SECS", IDLE_CHILD_SECS)
@@ -428,15 +431,22 @@ fn start(scratch: &Path, home: &Path) -> (Daemon, PathBuf) {
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();
-    let ready = BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
+    let mut lines = BufReader::new(stdout).lines().map_while(Result::ok);
+    let ready = lines
+        .by_ref()
         .any(|line| serde_json::from_str::<Value>(&line).is_ok_and(|v| v["ready"] == true));
     if !ready {
         let _ = child.kill();
         panic!("the daemon exited without a readiness line: {:?}", child.wait());
     }
-    (Daemon(child), socket)
+    let log = Log::default();
+    let keep = log.clone();
+    std::thread::spawn(move || {
+        for line in lines {
+            keep.lock().unwrap().push((std::time::Instant::now(), line));
+        }
+    });
+    (Daemon(child), socket, log)
 }
 
 #[test]
@@ -457,7 +467,7 @@ fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups() {
         "defaultHarness": "fake", "permissionPolicy": "approve-all"
     });
     fs::write(home.join("config.json"), config.to_string()).unwrap();
-    let (daemon, socket) = start(&scratch, &home);
+    let (daemon, socket, log) = start(&scratch, &home);
     let pid = daemon.0.id();
 
     // The app's own connection: the session watch and the chat list watch.
@@ -484,16 +494,59 @@ fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups() {
         );
         streams.push(rpc.drain());
     }
+    let settle = std::time::Instant::now();
     std::thread::sleep(SETTLE);
 
     let procs = processes(pid, &home);
+    let mut edges = vec![std::time::Instant::now()];
     let mut marks = vec![procs.iter().map(|(p, _)| usage(*p)).collect::<Vec<_>>()];
     let mut daemon_threads = vec![threads(pid)];
     for _ in 0..WINDOWS {
         std::thread::sleep(WINDOW);
         marks.push(procs.iter().map(|(p, _)| usage(*p)).collect());
         daemon_threads.push(threads(pid));
+        edges.push(std::time::Instant::now());
     }
+    // PROBE: every process's windows, and the daemon's log lines by window.
+    let mut probe = Vec::new();
+    for (at, (p, name)) in procs.iter().enumerate() {
+        let windows: Vec<String> = marks
+            .windows(2)
+            .map(|pair| match (pair[0][at], pair[1][at]) {
+                (Some(a), Some(b)) => format!(
+                    "{:?}/{}",
+                    b.cpu.saturating_sub(a.cpu),
+                    b.switches.saturating_sub(a.switches)
+                ),
+                _ => "gone".to_owned(),
+            })
+            .collect();
+        probe.push(format!("PROBE process {name} (pid {p}) cpu/switches: {}", windows.join(" | ")));
+    }
+    {
+        let log = log.lock().unwrap();
+        probe.push(format!("PROBE log lines in all: {}", log.len()));
+        let cut = |line: &str| line.chars().take(400).collect::<String>();
+        for (at, line) in log.iter().filter(|(at, _)| *at >= settle && *at < edges[0]) {
+            probe.push(format!(
+                "PROBE settle +{:.3}s: {}",
+                (*at - settle).as_secs_f64(),
+                cut(line)
+            ));
+        }
+        for (n, pair) in edges.windows(2).enumerate() {
+            for (at, line) in log.iter().filter(|(at, _)| *at >= pair[0] && *at < pair[1]) {
+                probe.push(format!(
+                    "PROBE window {} +{:.3}s (settle +{:.3}s): {}",
+                    n + 1,
+                    (*at - pair[0]).as_secs_f64(),
+                    (*at - settle).as_secs_f64(),
+                    cut(line)
+                ));
+            }
+        }
+    }
+    let probe = probe.join("\n");
     let mut report = Vec::new();
     let mut busiest: Option<(u32, Duration)> = None;
     for (at, (p, name)) in procs.iter().enumerate() {
@@ -532,10 +585,9 @@ fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups() {
     drop(streams);
     drop(daemon);
     let _ = fs::remove_dir_all(&scratch);
-    assert!(
-        report.is_empty(),
-        "an idle acpmux daemon with {CHATS} finished chats woke up ({} processes measured):\n{}\n\
-         daemon threads that ran, per {WINDOW:?} window:\n{ran}\n{sampled}",
+    panic!(
+        "PROBE, never merges ({} processes measured):\n{}\n\
+         daemon threads that ran, per {WINDOW:?} window:\n{ran}\n{probe}\n{sampled}",
         procs.len(),
         report.join("\n")
     );
