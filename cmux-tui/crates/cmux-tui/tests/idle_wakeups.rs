@@ -94,6 +94,10 @@ impl Daemon {
             .env_remove("XDG_DATA_HOME")
             .env("CMUX_TUI_CONFIG", &config)
             .env("CMUX_NEXT_CONFIG_FILE", &settings)
+            // Usage patterns follow the settings file only, and their files (written only
+            // while `diagnostics.usagePatterns` is on) stay in the test's folder.
+            .env_remove("CMUX_USAGE_PATTERNS")
+            .env("CMUX_USAGE_PATTERNS_DIR", dir.join("usage-patterns"))
             .env("ACPMUX_SOCKET", &acpmux)
             .env("CMUX_TUI_TEST_JOURNAL_MAINTENANCE_INTERVAL_MS", MAINTENANCE_INTERVAL_MS)
             .stdout(Stdio::null())
@@ -460,6 +464,53 @@ fn cmux_next_daemon_idle_has_no_periodic_wakeups() {
     // The daemon waited for acpmux without retrying on a timer; it still
     // reaches acpmux as soon as acpmux binds its socket.
     assert_follows_acpmux_when_it_appears(&daemon);
+}
+
+/// Usage patterns (`diagnostics.usagePatterns`, off by default) follow the
+/// settings file by a kernel watch, not by a timer (the thread that reread the
+/// setting every 5 s ran in every window of the tests here). So turning the
+/// setting on in a running daemon must still start the counting with no
+/// restart, and a daemon that counts must not wake while it has nothing to
+/// write.
+#[test]
+fn cmux_next_daemon_follows_the_usage_patterns_setting_and_stays_idle() {
+    let daemon = Daemon::start("usage");
+    let files = daemon.dir.join("usage-patterns");
+    let commands = || {
+        cmux_usage_patterns::read_dir(&files)
+            .rollup
+            .counts
+            .get("command")
+            .map_or(0, |keys| keys.values().sum::<u64>())
+    };
+    let ask = |id: u64| {
+        request(&daemon.socket, serde_json::json!({"id": id, "cmd": "list-workspaces"}))
+            .expect("list-workspaces");
+    };
+    // Off (the settings file is `{}`): a command is not counted, nothing is written.
+    ask(10);
+    assert!(!files.exists(), "a daemon with the setting off wrote usage patterns");
+    fs::write(
+        daemon.dir.join("cmux-next.json"),
+        "{ \"diagnostics\": { \"usagePatterns\": true } }\n",
+    )
+    .unwrap();
+    // The same daemon counts the commands that come after the save, and writes the first
+    // count at once.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut id = 11;
+    while commands() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the running daemon did not start to count after the setting was turned on"
+        );
+        ask(id);
+        id += 1;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // On, with the app's streams open and nothing more to count: no timer runs (the one
+    // write of what the setup below counts is one event, not a periodic wake).
+    assert_idle(&daemon, || {});
 }
 
 /// Binds the daemon's acpmux socket the way acpmux does (creating its folder
