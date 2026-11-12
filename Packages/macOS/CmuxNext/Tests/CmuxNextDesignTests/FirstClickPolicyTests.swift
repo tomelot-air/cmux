@@ -117,6 +117,42 @@ struct FirstClickPolicyTests {
         #expect(!press(window, key: nil))
     }
 
+    /// PROBE, NOT FOR MERGE (SPACE SWITCH 4): the facts of this host for `anAttachedSheetKeepsTheKeys`. It always
+    /// records one issue, so that the step's log holds the line.
+    @Test func sheetProbe() async {
+        _ = NSApplication.shared
+        let environment = ProcessInfo.processInfo.environment
+        var facts = ["screens=\(NSScreen.screens.count) main=\(NSScreen.main != nil) active=\(NSApp.isActive) "
+            + "policy=\(NSApp.activationPolicy().rawValue) routed=\(environment["CMUX_CI_DISPLAY_ROUTED"] ?? "nil") "
+            + "gui=\(environment["CMUX_TEST_REQUIRE_GUI"] ?? "nil")"]
+        let window = mainWindow()
+        let sheet = panel()
+        defer { close(sheet, window) }
+        window.orderFront(nil)
+        facts.append("orderFront: visible=\(window.isVisible) number=\(window.windowNumber) "
+            + "onScreen=\(window.occlusionState.contains(.visible))")
+        window.beginSheet(sheet)
+        facts.append("beginSheet: attached=\(window.attachedSheet === sheet) sheets=\(window.sheets.count) "
+            + "parent=\(sheet.sheetParent === window) sheetVisible=\(sheet.isVisible)")
+        window.orderFrontRegardless()
+        facts.append("then orderFrontRegardless: visible=\(window.isVisible) attached=\(window.attachedSheet === sheet) "
+            + "sheets=\(window.sheets.count)")
+        try? await Task.sleep(for: .milliseconds(300))
+        facts.append("300 ms later: visible=\(window.isVisible) attached=\(window.attachedSheet === sheet) "
+            + "sheets=\(window.sheets.count)")
+        window.endSheet(sheet)
+        let second = mainWindow()
+        let secondSheet = panel()
+        defer { close(secondSheet, second) }
+        second.orderFrontRegardless()
+        second.beginSheet(secondSheet)
+        facts.append("orderFrontRegardless first: visible=\(second.isVisible) attached=\(second.attachedSheet === secondSheet) "
+            + "sheets=\(second.sheets.count)")
+        second.endSheet(secondSheet)
+        facts.append("hostShowsWindows=\(await CaptureBackdropSnapshotTests.hostShowsWindows())")
+        Issue.record("FCP-PROBE \(facts.joined(separator: " | "))")
+    }
+
     @Test func aCommandPressActsOverTheWindowsOwnPageOnly() {
         let window = mainWindow()
         let page = pageWindow(of: window)
