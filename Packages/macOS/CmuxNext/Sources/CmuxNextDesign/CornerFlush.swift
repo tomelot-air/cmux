@@ -129,7 +129,7 @@ public final class CornerFlushChrome: NSView {
     /// What the wedges were last drawn for (``apply``), so a strip's report redraws them alone.
     /// `card` is the content's whole frame; the card below the tab row is its top less a strip.
     private var drawn: (card: CGRect, radius: CGFloat, alpha: CGFloat, sidebarOnLeft: Bool)?
-    /// The shade under the content, whose hole goes square with the leading wedge.
+    /// The shade under the content, which leaves the top corners to the wedges above it.
     private weak var shade: MainPaneChromeShadeView?
     /// The content the card holds, whose top corners round again while no strip shows.
     private weak var content: NSView?
@@ -212,7 +212,8 @@ public final class CornerFlushChrome: NSView {
         defer { CATransaction.commit() }
         wedges.frame = bounds
         var card = drawn.card
-        card.size.height = max(0, card.height - Metrics.tabStripHeight) // the top is maxY
+        let stripHeight = PaneChromeMetrics.current.resolvedStripHeight(scale: window?.backingScaleFactor ?? 2)
+        card.size.height = max(0, card.height - stripHeight) // the top is maxY
         // A top pane hid its strip or its strip left the top (vertical tabs, a hidden tab bar, a canvas
         // pan): no whole tab row, so the card is the whole content, rounded on every corner, with no
         // wedges and no shade band over that pane's content.
@@ -224,12 +225,12 @@ public final class CornerFlushChrome: NSView {
             return
         }
         if let content { Self.roundBottomOnly(content, true) }
-        markTopRow(card: card, in: root)
         let square = leadingTabSelected(card: card, sidebarOnLeft: drawn.sidebarOnLeft, in: root)
+        markTopRow(card: card, radius: drawn.radius, squareLeading: square, in: root)
         wedges.path = Self.wedgePath(card: card, radius: drawn.radius, squareLeading: square, sidebarOnLeft: drawn.sidebarOnLeft)
         wedges.fillColor = NSColor.black.withAlphaComponent(drawn.alpha).cgColor
-        // The shade under a translucent terminal would show the rounded corner the wedge no longer draws.
-        shade?.update(card: card, radius: drawn.radius, alpha: drawn.alpha, squareTopLeading: square)
+        // Each wedge shades its corner once, including over transparent content.
+        shade?.update(card: card, radius: drawn.radius, alpha: drawn.alpha, squareTopCorners: true)
     }
 
     /// Whether the window's tab row is whole: some shown pane's strip sits on the card's top, and every
@@ -251,10 +252,18 @@ public final class CornerFlushChrome: NSView {
 
     /// Tells each strip of this window whether it is on the top row of `card` (nil: no tab row, so none
     /// is), so only those run their selected tab into the card. O(strips); a strip relays out only on a change.
-    private func markTopRow(card: CGRect?, in root: NSView) {
+    private func markTopRow(card: CGRect?, radius: CGFloat = 0, squareLeading: Bool = false, in root: NSView) {
+        var clip = card
+        if squareLeading {
+            clip?.origin.x -= radius
+            clip?.size.width += radius
+        }
         for case let strip as (any TabStripCorner & NSView) in strips.allObjects where strip.window === root.window {
             let onTop = card.map { !strip.isHidden && abs(root.convert(strip.cornerFrameInWindow, from: nil).minY - $0.maxY) < 2 } ?? false
             strip.setRunsIntoCard(onTop)
+            for case let area as PaneContentAreaView in strip.superview?.subviews ?? [] {
+                area.setChromeClip(card: onTop ? clip : nil, radius: radius, in: root)
+            }
         }
     }
 

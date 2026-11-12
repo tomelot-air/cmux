@@ -14,8 +14,8 @@ public final class MainPaneChromeShadeView: NSView {
     private var card: CGRect = .zero
     private var radius: CGFloat = 0
     private var alpha: CGFloat = 0
-    /// The card's top corner at minX is square (the flush corner's first tab rises from it).
-    private var squareTopLeading = false
+    /// The flush corner paints the top wedges above the content, so the shade below leaves both corners clear.
+    private var squareTopCorners = false
     private var cardsObservation: AnyObject?
     /// The shown workspace's pane cards; a sync of theirs reshapes the shade.
     public weak var paneCards: (any PaneCardSource)? {
@@ -50,14 +50,14 @@ public final class MainPaneChromeShadeView: NSView {
 
     /// Shades everything but `card` (this view's coordinates); no shade when
     /// `alpha` is 0.
-    /// `squareTopLeading`: the card's top corner at minX is square (`CornerFlushChrome`).
-    public func update(card: CGRect, radius: CGFloat, alpha: CGFloat, squareTopLeading: Bool = false) {
-        guard card != self.card || radius != self.radius || alpha != self.alpha || squareTopLeading != self.squareTopLeading
+    /// `squareTopCorners`: the top corners are shaded by `CornerFlushChrome`, not this layer.
+    public func update(card: CGRect, radius: CGFloat, alpha: CGFloat, squareTopCorners: Bool = false) {
+        guard card != self.card || radius != self.radius || alpha != self.alpha || squareTopCorners != self.squareTopCorners
             || shade.frame != bounds || Metrics.floatingPanes else { return }
         self.card = card
         self.radius = radius
         self.alpha = alpha
-        self.squareTopLeading = squareTopLeading
+        self.squareTopCorners = squareTopCorners
         rebuild()
     }
 
@@ -83,10 +83,11 @@ public final class MainPaneChromeShadeView: NSView {
             let corner = min(radius, card.width / 2, card.height / 2)
             let visible = cut.intersection(CGPath(roundedRect: card, cornerWidth: corner, cornerHeight: corner, transform: nil))
             shade.path = CGPath(rect: bounds, transform: nil).subtracting(visible)
-        } else if squareTopLeading {
+        } else if squareTopCorners {
             let corner = min(radius, card.width / 2, card.height / 2)
             let hole = CGPath(roundedRect: card, cornerWidth: corner, cornerHeight: corner, transform: nil)
                 .union(CGPath(rect: CGRect(x: card.minX, y: card.maxY - corner, width: corner, height: corner), transform: nil))
+                .union(CGPath(rect: CGRect(x: card.maxX - corner, y: card.maxY - corner, width: corner, height: corner), transform: nil))
             shade.path = CGPath(rect: bounds, transform: nil).subtracting(hole)
         } else {
             let path = CGMutablePath()
