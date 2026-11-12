@@ -329,6 +329,9 @@ pub struct World {
     /// What the platform answers next (200 grants, anything else refuses).
     pub status: Arc<AtomicU16>,
     pub dir: tempfile::TempDir,
+    /// How many links a dial closed while the parking proxy still held them
+    /// ([`world_parked`]; 0 in every other world).
+    pub parked_links_closed: Arc<AtomicUsize>,
     /// The daemon's registration (set late in [`world_parked`]).
     _registration: Registration,
     _runtime: tokio::runtime::Runtime,
@@ -412,6 +415,7 @@ fn world_with(
     let bearers = Bearers::default();
     let shared_status = Arc::new(AtomicU16::new(status));
     let answered = shared_status.clone();
+    let parked_links_closed = Arc::new(AtomicUsize::new(0));
     let (platform, registration, relay, signer, daemon_key) = runtime.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_address = listener.local_addr().unwrap();
@@ -458,7 +462,9 @@ fn world_with(
             Some(after) => {
                 let (registered, open) = watch::channel(false);
                 let held = Arc::new(Notify::new());
-                let proxy = parking_proxy(relay_address, open, held.clone()).await;
+                let proxy =
+                    parking_proxy(relay_address, open, held.clone(), parked_links_closed.clone())
+                        .await;
                 let late = registration.clone();
                 tokio::spawn(async move {
                     held.notified().await;
@@ -506,6 +512,7 @@ fn world_with(
         signer,
         status: shared_status,
         dir,
+        parked_links_closed,
         _registration: registration,
         _runtime: runtime,
     }
@@ -513,18 +520,21 @@ fn world_with(
 
 /// A proxy to `relay` that holds each connection's client bytes after its
 /// WebSocket upgrade until `open` is true, and notifies `held` when it
-/// holds one. The relay's bytes to the client always flow.
+/// holds one. The relay's bytes to the client always flow. A link its client
+/// closes while the proxy holds it is counted in `closed`, and its held bytes
+/// never reach the relay: the client gave that link up.
 async fn parking_proxy(
     relay: SocketAddr,
     open: watch::Receiver<bool>,
     held: Arc<Notify>,
+    closed: Arc<AtomicUsize>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
             let Ok((client, _)) = listener.accept().await else { return };
-            let (mut open, held) = (open.clone(), held.clone());
+            let (mut open, held, closed) = (open.clone(), held.clone(), closed.clone());
             tokio::spawn(async move {
                 let Ok(upstream) = TcpStream::connect(relay).await else { return };
                 let (mut client_read, mut client_write) = client.into_split();
@@ -550,8 +560,25 @@ async fn parking_proxy(
                 }
                 if !*open.borrow() {
                     held.notify_one();
-                    if open.wait_for(|open| *open).await.is_err() {
-                        return;
+                    let opened = async { open.wait_for(|open| *open).await.is_ok() };
+                    tokio::pin!(opened);
+                    loop {
+                        tokio::select! {
+                            is_open = &mut opened => {
+                                if !is_open {
+                                    return;
+                                }
+                                break;
+                            }
+                            read = client_read.read(&mut chunk) => match read {
+                                // The client closed the link it could not use.
+                                Ok(0) | Err(_) => {
+                                    closed.fetch_add(1, Ordering::SeqCst);
+                                    return;
+                                }
+                                Ok(read) => request.extend(chunk.iter().take(read).copied()),
+                            },
+                        }
                     }
                 }
                 if upstream_write.write_all(&request[end..]).await.is_err() {
