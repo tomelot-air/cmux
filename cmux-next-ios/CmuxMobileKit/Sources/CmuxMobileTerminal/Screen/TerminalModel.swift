@@ -230,6 +230,9 @@ public final class TerminalModel {
     func ingest(_ event: TerminalSessionEvent) {
         let connection = connectionState.applying(event)
         if connection != connectionState { connectionState = connection }
+        // Attached again: a held composer send went out (or was dropped, which says so
+        // first); a later drop must never put already-sent text back.
+        if connection.isAttached { heldComposerSend = nil }
         switch event {
         case .output:
             // The bytes are scanned once per display frame (`scanOutput`).
