@@ -20,15 +20,17 @@
 //! rollup keeps the newest [`KEEP_DAYS`] days, and the hour histogram has 24
 //! slots, so a file never grows past a fixed size.
 //!
-//! Nothing here polls. A kernel file watch on the settings file
-//! ([`Recorder::watch`]) tells the recorder when the setting may have changed.
-//! The flush thread starts the first time counting is on, is parked while
-//! there is nothing to write, and writes at most every [`FLUSH_EVERY`]. So
-//! while the setting is off, or on with nothing counted, no thread of this
-//! crate runs.
+//! Nothing here runs on a timer. A kernel file watch on the settings file
+//! ([`Recorder::watch`]) tells the recorder when the setting may have changed;
+//! its thread is blocked in the kernel until an entry of the settings folder
+//! changes (as the settings owner's watch is). The flush thread starts the
+//! first time counting is on, is parked while there is nothing to write, and
+//! writes at most every [`FLUSH_EVERY`]. So while the setting is off, or on
+//! with nothing counted, an idle process does not wake for this crate.
 //!
 //! Reset: `cmux usage-patterns reset` deletes the files. A recorder that wrote its file
-//! and finds it gone drops what it holds instead of writing it back.
+//! and finds it gone at its next write drops what it holds instead of writing it back
+//! (with the counts made between the reset and that write).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -342,9 +344,14 @@ pub struct Recorder {
     config: PathBuf,
     enabled: AtomicBool,
     state: Mutex<State>,
+    /// One writer of the file at a time: the flush thread and the settings
+    /// watch (when counting stops) both write, through one temporary file.
+    writing: Mutex<()>,
     /// The flush thread, from the first time counting was on (None inside:
     /// the thread could not start).
     flusher: OnceLock<Option<std::thread::Thread>>,
+    /// The least time between two writes ([`FLUSH_EVERY`]).
+    flush_every: Duration,
 }
 
 #[derive(Default)]
@@ -377,7 +384,9 @@ impl Recorder {
                 rollup: loaded.unwrap_or_default(),
                 ..State::default()
             }),
+            writing: Mutex::new(()),
             flusher: OnceLock::new(),
+            flush_every: FLUSH_EVERY,
         };
         recorder.refresh_gate();
         recorder
@@ -458,8 +467,8 @@ impl Recorder {
     /// change of the file calls [`Recorder::settings_changed`] on the
     /// watcher's thread, and the flush thread starts the first time counting
     /// is on. Keep the returned watcher for as long as the recorder follows
-    /// the setting. None when the watch cannot start: the gate then stays as
-    /// it was read last.
+    /// the setting. None when the watch cannot start: nothing then tells the
+    /// recorder that the setting changed ([`install`] stops counting).
     pub fn watch(self: &Arc<Self>) -> Option<cmux_config::Watcher> {
         let mut files = vec![self.config.clone()];
         let target = cmux_config::fsio::resolve_symlinks(&self.config);
@@ -514,13 +523,15 @@ impl Recorder {
         state.dirty.then(|| {
             state
                 .last_flush
-                .map_or(Duration::ZERO, |last| FLUSH_EVERY.saturating_sub(last.elapsed()))
+                .map_or(Duration::ZERO, |last| self.flush_every.saturating_sub(last.elapsed()))
         })
     }
 
     /// Writes the rollup when it changed. A file this recorder wrote that is
     /// gone now was reset: the rollup is dropped, not written back.
     pub fn flush(&self) -> std::io::Result<()> {
+        // Held to the rename: a second writer waits, then writes what came after.
+        let _writing = self.writing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.last_flush = Some(Instant::now());
         if state.written && !self.path.exists() {
@@ -560,16 +571,26 @@ fn flush_loop(recorder: &Weak<Recorder>) {
         let Some(wait) = recorder.upgrade().map(|recorder| recorder.flush_wait()) else {
             return;
         };
-        match wait {
-            None => std::thread::park(),
-            Some(wait) => {
-                std::thread::sleep(wait);
-                let Some(recorder) = recorder.upgrade() else {
-                    return;
-                };
-                let _ = recorder.flush();
+        let Some(wait) = wait else {
+            std::thread::park();
+            continue;
+        };
+        // Parked to the time of the write, not asleep: the drop of the
+        // recorder ends the thread at once. Any other wake waits on.
+        let due = Instant::now().checked_add(wait);
+        while let Some(left) = due
+            .map(|due| due.saturating_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+        {
+            std::thread::park_timeout(left);
+            if recorder.strong_count() == 0 {
+                return;
             }
         }
+        let Some(recorder) = recorder.upgrade() else {
+            return;
+        };
+        let _ = recorder.flush();
     }
 }
 
@@ -599,7 +620,9 @@ static WATCH: Mutex<Option<cmux_config::Watcher>> = Mutex::new(None);
 
 /// Installs this process's recorder as `writer` (once; later calls return
 /// the first) in [`default_dir`], gated by the settings file, which it
-/// follows with [`Recorder::watch`]. None when there is no state directory.
+/// follows with [`Recorder::watch`]. When that watch cannot start (no free
+/// kernel watch), this process does not count: it could not see the setting
+/// go off. None when there is no state directory.
 pub fn install(writer: &str) -> Option<Arc<Recorder>> {
     if let Some(recorder) = GLOBAL.get() {
         return Some(Arc::clone(recorder));
@@ -610,15 +633,21 @@ pub fn install(writer: &str) -> Option<Arc<Recorder>> {
     if GLOBAL.set(Arc::clone(&recorder)).is_err() {
         return GLOBAL.get().cloned();
     }
-    // On at the start: the flush thread is there for the first count, also
-    // when the watch cannot start.
+    // A blocked kernel watch, no timer. Not needed while the variable forces
+    // the gate: no save can change it then.
+    if env_override().is_none() {
+        let watch = recorder.watch();
+        if watch.is_none() {
+            // Nothing would tell this process that the person turned the
+            // setting off: it does not count at all, rather than count on.
+            recorder.enabled.store(false, Ordering::Relaxed);
+        }
+        *WATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = watch;
+    }
+    // On at the start: the flush thread is there for the first count.
     if recorder.enabled() {
         recorder.start_flusher();
     }
-    // A blocked kernel watch, no timer: nothing of this crate runs while the
-    // setting is off, or on with nothing counted.
-    let watch = recorder.watch();
-    *WATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = watch;
     Some(recorder)
 }
 

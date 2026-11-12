@@ -191,6 +191,49 @@ fn the_flush_thread_starts_only_when_counting_is_on() {
     assert_eq!(first, again, "one flush thread for the recorder's life");
 }
 
+/// The flush thread writes every count, not only the first: a count after a write wakes the
+/// parked thread again, and the write comes when the time between two writes has passed.
+#[test]
+fn the_flush_thread_writes_each_count_that_comes_after_a_write() {
+    let dir = scratch("later");
+    let out = dir.join("out");
+    let mut recorder = Recorder::open(&out, "session-a", config(&dir, true));
+    recorder.flush_every = Duration::from_millis(50);
+    let recorder = Arc::new(recorder);
+    recorder.start_flusher();
+    let splits =
+        || read_dir(&out).rollup.counts.get("command").and_then(|keys| keys.get("split")).copied();
+    for n in 1..=3 {
+        recorder.count("command", "split");
+        wait_for("the flush thread to write the count", || splits() == Some(n));
+        wait_for("the flush thread to have nothing more to write", || {
+            recorder.flush_wait().is_none()
+        });
+    }
+}
+
+/// A dropped recorder ends its flush thread at once, also while the thread waits for the time
+/// of its next write (30 s away here).
+#[test]
+fn the_flush_thread_ends_with_its_recorder() {
+    let dir = scratch("ends");
+    let recorder = Arc::new(Recorder::open(&dir.join("out"), "session-a", config(&dir, true)));
+    // The flush thread as `start_flusher` starts it, with a handle the test can wait on.
+    let weak = Arc::downgrade(&recorder);
+    let thread = std::thread::spawn(move || flush_loop(&weak));
+    assert!(recorder.flusher.set(Some(thread.thread().clone())).is_ok());
+    recorder.wake_flusher();
+    recorder.count("command", "split");
+    wait_for("the first count to be written", || recorder.path().exists());
+    wait_for("the flush thread to have nothing more to write", || recorder.flush_wait().is_none());
+    // Due in FLUSH_EVERY: the thread waits for that time now.
+    recorder.count("command", "split");
+    assert!(recorder.flush_wait().is_some_and(|wait| wait > FLUSH_EVERY / 2));
+    drop(recorder);
+    wait_for("the flush thread to end", || thread.is_finished());
+    thread.join().unwrap();
+}
+
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs(20);
     while !done() {
