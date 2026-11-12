@@ -33,7 +33,7 @@ const IDLE_CHILD_SECS: &str = "3";
 const SETTLE: Duration = Duration::from_secs(15);
 /// Quiet window over which wakeups are counted, and how many (the median is judged).
 const WINDOW: Duration = Duration::from_secs(10);
-const WINDOWS: u32 = 6;
+const WINDOWS: u32 = 8;
 /// Context switches allowed per process in its median window: a 1 Hz wake gives 10.
 const MAX_SWITCHES_PER_WINDOW: u64 = 5;
 /// CPU allowed per process in its median window: 0.5 % of one core.
@@ -418,9 +418,13 @@ impl Drop for Daemon {
 /// PROBE: the daemon's log lines, each with the time the test read it.
 type Log = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, String)>>>;
 
-fn start(scratch: &Path, home: &Path) -> (Daemon, PathBuf, Log) {
+fn start(scratch: &Path, home: &Path, checkpoint_ms: Option<&str>) -> (Daemon, PathBuf, Log) {
     let socket = scratch.join("s.sock");
-    let mut child = daemon_env::command(scratch, daemon_env::Agents::StandIn, &[])
+    let mut command = daemon_env::command(scratch, daemon_env::Agents::StandIn, &[]);
+    if let Some(ms) = checkpoint_ms {
+        command.env("ACPMUX_TEST_JOURNAL_CHECKPOINT_MS", ms);
+    }
+    let mut child = command
         .args(["daemon", "run", "--ready-fd", "1", "--log", "trace"])
         .env("ACPMUX_HOME", home)
         .env("ACPMUX_SOCKET", &socket)
@@ -451,6 +455,16 @@ fn start(scratch: &Path, home: &Path) -> (Daemon, PathBuf, Log) {
 
 #[test]
 fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups() {
+    probe(None);
+}
+
+/// PROBE: the journal checkpoint comes 1 s after a change, so it is over before the windows.
+#[test]
+fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups_with_an_early_checkpoint() {
+    probe(Some("1000"));
+}
+
+fn probe(checkpoint_ms: Option<&str>) {
     let scratch = std::env::temp_dir().join(format!(
         "amx-idlechat-{}-{}",
         std::process::id(),
@@ -467,7 +481,7 @@ fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups() {
         "defaultHarness": "fake", "permissionPolicy": "approve-all"
     });
     fs::write(home.join("config.json"), config.to_string()).unwrap();
-    let (daemon, socket, log) = start(&scratch, &home);
+    let (daemon, socket, log) = start(&scratch, &home, checkpoint_ms);
     let pid = daemon.0.id();
 
     // The app's own connection: the session watch and the chat list watch.
@@ -547,6 +561,8 @@ fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups() {
         }
     }
     let probe = probe.join("\n");
+    // Before the sample: a run that passes its time limit still shows these lines.
+    println!("checkpoint_ms {checkpoint_ms:?}\n{}\n{probe}", thread_report(&daemon_threads));
     let mut report = Vec::new();
     let mut busiest: Option<(u32, Duration)> = None;
     for (at, (p, name)) in procs.iter().enumerate() {
@@ -586,7 +602,7 @@ fn acpmux_daemon_with_finished_chats_has_no_periodic_wakeups() {
     drop(daemon);
     let _ = fs::remove_dir_all(&scratch);
     panic!(
-        "PROBE, never merges ({} processes measured):\n{}\n\
+        "PROBE, never merges, checkpoint_ms {checkpoint_ms:?} ({} processes measured):\n{}\n\
          daemon threads that ran, per {WINDOW:?} window:\n{ran}\n{probe}\n{sampled}",
         procs.len(),
         report.join("\n")
